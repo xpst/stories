@@ -58,6 +58,8 @@ This is the optimization that makes Linux NAT fast. It would be prohibitively ex
 
 This works fine for short-lived UDP exchanges like DNS queries. But a long-lived UDP exporter - NetFlow, sFlow, IPFIX, syslog, RTP, GTP-U - sends continuously from a fixed source port. Every packet matches the same conntrack entry by 5-tuple and resets the idle timer. The entry refreshes forever and never times out.
 
+The fixed source port is load-bearing here. A naive `nc -u` loop without `-p` gets a fresh ephemeral source port on every packet, so every packet creates its own conntrack entry - broken entries can still form during the empty-rules window, but they each age out individually within `nf_conntrack_udp_timeout` and subsequent ephemeral-port flows traverse NAT cleanly. The "stuck forever" property of the bug specifically requires a single long-lived 4-tuple, which is what real-world telemetry exporters produce and what a synthetic reproducer needs to mimic if you want to study the persistence aspect.
+
 **Property 3: kube-proxy maintains iptables rules asynchronously, with windows of inconsistency.** kube-proxy watches the Kubernetes API for Service and EndpointSlice changes, computes the iptables rule set it wants to install, and applies it via `iptables-restore`. The reconcile loop is fast in steady state but it has finite-duration windows where the kernel's rules don't reflect the current desired state - most notably during kube-proxy's own startup, while it's syncing API caches, or if the API server is temporarily unreachable.
 
 If kube-proxy is in such a window for ~80 seconds at startup, and your UDP exporter sends a packet during that window, here is what happens:
@@ -71,6 +73,30 @@ If kube-proxy is in such a window for ~80 seconds at startup, and your UDP expor
 7. kube-proxy finishes its sync seconds later. The iptables rule is now correct. But the kernel reads conntrack, not iptables, for established flows. **The traffic silently evaporates inside the host.**
 
 The mental model I use for this: NAT chains are a wall of redirect rules; conntrack is a stack of sticky notes the kernel keeps next to the wall. When a new conversation arrives, the kernel reads the wall and writes a sticky note. From then on, it reads only the sticky note. The bug is what happens when the kernel writes a sticky note while the wall is briefly empty: the note says "deliver as-is," and that note now overrides any rule that gets stuck on the wall later.
+
+## Catching it in the act
+
+I went back later and rigged a lab cluster to reproduce the bug deterministically - a fresh boot with the exporter sending the whole time, plus a small readiness-probe delay on the listener pod so the empty-rule window was wide enough to capture. Sampling `conntrack` and `iptables` every half-second across the post-boot recovery window gave me the moment the bug forms in single-snapshot resolution. Two consecutive snapshots, ~500 ms apart, tell the whole story.
+
+Just before kube-proxy's first sync finishes (the "wall empty" state):
+
+```
+udp  17 29  src=<exporter-IP>  dst=<node-IP>     sport=X        dport=31234  [UNREPLIED]
+            src=<node-IP>      dst=<exporter-IP> sport=31234    dport=X
+```
+
+(No `KUBE-NODEPORTS` rule installed yet; SVL chain not present. Reply tuple is just the original reversed - no DNAT.)
+
+500 ms later, after kube-proxy's first iptables-restore lands:
+
+```
+udp  17 29  src=<exporter-IP>  dst=<node-IP>     sport=X        dport=31234  [UNREPLIED]
+            src=<pod-IP>       dst=<exporter-IP> sport=<pod port> dport=X
+```
+
+(NAT rules now present; reply tuple now shows the pod's IP and target port. Same 4-tuple as before; healthy DNAT.)
+
+A conntrack entry's reply tuple is immutable once set - the kernel doesn't edit existing entries, only creates and deletes them. So the apparent "flip" between these two snapshots is necessarily an entry deletion plus a recreation: kube-proxy's reconcile path explicitly flushed the broken entry as part of installing its rules, and the next exporter packet (within the same 500 ms window) created a fresh entry that hit the just-installed DNAT. This turns out to matter - it's what newer versions of kube-proxy now do reliably, and it's the basis for the "fifth thing" further down.
 
 ## Why it's hard to notice
 
@@ -99,6 +125,8 @@ This tears up the sticky note. The very next packet of the flow has no cached en
 
 A caveat: it matters that the iptables rules are correct at the moment the next packet arrives. If something external has flushed kube-proxy's chains (more on this below) and the rules are still empty, `conntrack -D` will just produce another no-DNAT entry within milliseconds. In normal operation, where kube-proxy's rules are intact, this is the cleanest possible fix.
 
+On newer kube-proxy versions, the caveat is largely self-resolving: kube-proxy's reconcile path flushes conntrack itself when it installs rules, so the order of operations matters less. On older kube-proxy versions, the caveat is real and worth checking the rules before flushing the entry.
+
 ### Remote remediation: trigger a kube-proxy resync via a real Service change
 
 When you don't have shell access to the affected node, you can force kube-proxy to flush conntrack on your behalf - but it's surprisingly picky about which signals will do it.
@@ -108,6 +136,8 @@ When you don't have shell access to the affected node, you can force kube-proxy 
 What does **not** work, based on testing: `kubectl annotate svc/endpointslice`, `kubectl delete svc` (deleting and recreating the Service is not enough to trigger the relevant cleanup path on the kube-proxy build I tested), and `kubectl delete pod -n kube-system kube-proxy-<node>` (the iptables rules persist in the kernel across kube-proxy process restarts, and the new instance treats existing chains as already-managed).
 
 If you need to do this remotely, prefer Helm or any other path that produces a real Service or EndpointSlice content change. Annotation-only events are filtered out by kube-proxy's change tracker.
+
+One caveat worth flagging, because I tripped over it later: the "what does not work" list above is what I observed on the kube-proxy version originally affected. When I went back and retested on a newer cluster, `kubectl annotate svc/<name>` *did* heal the symptom - the newer kube-proxy's reconcile path appears to do more work than the older one, including a `ClearEntriesForPort`-style conntrack flush on every reconcile (not just on real-content changes). So if you're on a recent enough kube-proxy, the simplest remote remediation may actually be a no-op annotation. On the older build I tested originally, it was reliably a no-op in the unhelpful sense. Test against your own version before relying on it.
 
 ### Per-Service structural fix: `hostNetwork: true`
 
@@ -148,6 +178,30 @@ Comparing the two structural fixes:
 
 For a single Service hit by this bug whose workload shape fits, `hostNetwork: true` is often the smaller, cleaner fix. For a cluster where the bug pattern could plausibly affect future Services too, the cluster-wide IPVS migration is the more comprehensive answer. They're not mutually exclusive.
 
+## A fifth thing worth knowing: kube-proxy version matters
+
+This isn't a fifth fix; it's an observation about the threat model that I didn't fully appreciate until I went back and retested. The kube-proxy version on your cluster reshapes the danger of this bug substantially.
+
+On the older kube-proxy build originally affected, a broken conntrack entry is essentially permanent once created. Nothing routine clears it. `conntrack -D` or `helm upgrade` works (those are deliberate operator actions); pod restarts don't, annotation pokes don't, and kube-proxy's own periodic sync doesn't, because conntrack isn't part of kube-proxy's reconcile model on that build. The bug is sticky, and the only way out is the human one-liner.
+
+On newer kube-proxy builds, broken entries still form by the same mechanism - I reproduced one cleanly in the lab (the snapshot pair from earlier in this article is from that exact run). What changed is that kube-proxy now flushes conntrack for the affected port as part of essentially every reconcile triggered by Service or EndpointSlice state changes. The mechanism is the same `ClearEntriesForPort`-style flush that `helm upgrade` already used to lean on, except now it's wired into a much wider range of triggers. Pod restart, helm upgrade, annotation, even the routine pod-readiness transition that follows a fresh boot - all of them clear the broken entry within seconds.
+
+A short comparison:
+
+```
+                                       Older kube-proxy   Newer kube-proxy
+Bug forms during a kube-proxy gap      yes                yes
+`conntrack -D` heals                   ✓                  ✓
+`helm upgrade` heals                   ✓                  ✓
+`kubectl annotate svc/endpointslice`   no-op              heals
+Pod restart / readiness change heals   no                 yes
+First-sync at kube-proxy startup       n/a                heals on boot
+```
+
+The bug *can* still persist on a newer kube-proxy build, but only when kube-proxy itself is unable to reconcile - for instance, when it's lost API-server connectivity for the duration the broken entry needs to survive, which is exactly the original incident pattern. In other words: on newer clusters, the bug class is largely self-healing, and the residual risk narrows to "kube-proxy can't reconcile," which is closer to a kube-proxy-availability problem than a conntrack problem.
+
+If you're operating a mixed fleet across kube-proxy versions, this distinction matters for triage. Same symptom, same diagnostic signature, but very different stickiness.
+
 ## A footnote: kube-proxy doesn't auto-repair externally-flushed chains
 
 While reproducing this bug on a test cluster, I noticed a sub-finding worth flagging.
@@ -168,6 +222,8 @@ Practical consequence: any third-party tool that touches iptables on a kube-prox
 
 This isn't strictly part of the UDP bug, but it's adjacent to it and worth knowing if you're in this layer.
 
+A version-aware note (because I retested this later, same as I did with the remote-remediation list above): the no-op annotation behavior is what I observed on the older kube-proxy build. On newer kube-proxy versions, the same annotation does trigger a real reconcile that re-installs the externally-flushed chain and flushes conntrack for the affected port - i.e. the failure mode this footnote describes is structurally less reachable on newer builds. The `iptables-restore --noflush` and "skip if buffer unchanged" mechanisms above are still real and still describe what kube-proxy does internally; what's changed is that newer builds appear to do more work outside that fast path on Service-related events, which is enough to recover the kernel state in cases where the older build would have stayed stuck.
+
 ## The bug lives in the seam between layers
 
 What I keep coming back to: nothing here is broken.
@@ -179,5 +235,7 @@ The failure is emergent across the seam between them - the space that no single 
 This is why the bug takes days to find. The path you'd usually take - "where is the packet getting dropped?" - returns nothing, because the packet isn't being *dropped*. It's being correctly delivered to the address that conntrack believes is the correct destination, which happens to be a host port with no listener. Every layer would, if asked, confirm that it did its job. Nothing has anyone to point at.
 
 The fix at incident-time is `conntrack -D` and it takes a second. But the bug class is the kind that gets baked into systems when correct-in-isolation pieces are composed without an end-to-end consistency invariant. We have a lot of these in our infrastructure, and most of them are silent until they're not. The interesting question, the one I'm still chasing, isn't "how do we fix this specific bug" but "how do we get better at finding the next one of these before it costs us a week."
+
+One small reason for optimism: the seam isn't immutable. Newer kube-proxy builds appear to be starting to police the boundary they used to ignore - flushing conntrack as part of their reconcile path, so that even when the broken sticky note gets written, it gets torn up the next time anything Service-related happens. The fundamental seam-bug shape is still there (the broken entry can still form), but the window of consequence is now seconds rather than indefinite. That's not a fix for the class of bug in general; it's one specific seam where the layers are starting to talk to each other a little more. The interesting work, presumably, is in noticing the next seam *before* a 1.x.x release notices it for you.
 
 If anyone reading this has worked through similar seam-between-layers bugs in their own systems - particularly the ones where every layer's diagnostics come back clean - I'd be curious to compare notes.
